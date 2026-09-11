@@ -143,33 +143,32 @@ function tokyoNow(now) {
   };
 }
 
+/* 「開始日+開始時刻」から「締切日+締切時刻」までの、一続きの期間として判定する。
+   （毎日決まった時間帯だけ、という繰り返しの窓ではない。この期間内はいつでも
+   編集可能で、期間外は常に不可。after_hours_mode は使わなくなったが、既存の
+   DB 列・CHECK 制約はそのまま残しており、このアプリからは書き込まない。） */
+function dateTimeKey(date, minutes) {
+  return `${date} ${String(minutes).padStart(4, "0")}`;
+}
+
 function selectionWindow(settings, now) {
   const s = settings || {};
   const startsOn = toIsoDate(pick(s, ["starts_on", "start_on", "opens_on"], ""));
   const deadlineOn = toIsoDate(pick(s, ["deadline_on", "deadline", "ends_on"], ""));
   const openAt = toTimeInputValue(pick(s, ["daily_open", "open_time"], ""));
   const closeAt = toTimeInputValue(pick(s, ["daily_close", "close_time"], ""));
-  const known = !!(startsOn || deadlineOn || openAt || closeAt);
+  const known = !!(startsOn || deadlineOn);
   const jst = tokyoNow(now);
 
-  const inPeriod =
-    (!startsOn || jst.date >= startsOn) && (!deadlineOn || jst.date <= deadlineOn);
+  const nowKey = dateTimeKey(jst.date, jst.minutes);
+  const startKey = startsOn ? dateTimeKey(startsOn, timeToMinutes(openAt) ?? 0) : null;
+  const endKey = deadlineOn ? dateTimeKey(deadlineOn, timeToMinutes(closeAt) ?? 1439) : null;
 
-  const from = timeToMinutes(openAt);
-  const to = timeToMinutes(closeAt);
-  let inHours = true;
-  if (from !== null && to !== null) {
-    inHours = from <= to
-      ? jst.minutes >= from && jst.minutes <= to
-      : jst.minutes >= from || jst.minutes <= to;
-  }
-
-  const afterHoursAllowed =
-    afterHoursKey(pick(s, ["after_hours_mode"], "")) === "allow";
+  const inPeriod = (!startKey || nowKey >= startKey) && (!endKey || nowKey <= endKey);
 
   return {
-    known, startsOn, deadlineOn, openAt, closeAt, inPeriod, inHours,
-    open: inPeriod && (inHours || afterHoursAllowed),
+    known, startsOn, deadlineOn, openAt, closeAt, inPeriod,
+    open: inPeriod,
   };
 }
 
@@ -899,20 +898,20 @@ function bootStudent(tok) {
 
     const { groups, unclassified } = buildTimetable(slots);
 
+    const startLabel = win.startsOn
+      ? `${fmtDateOnly(win.startsOn)} ${win.openAt || "00:00"}`
+      : "指定なし";
+    const endLabel = win.deadlineOn
+      ? `${fmtDateOnly(win.deadlineOn)} ${win.closeAt || "23:59"}`
+      : "指定なし";
     const periodLine =
       win.startsOn || win.deadlineOn
-        ? `<div class="banner-detail">受付期間：${escapeHtml(fmtDateOnly(win.startsOn) || "—")} ～ ${escapeHtml(fmtDateOnly(win.deadlineOn) || "—")}</div>`
-        : "";
-    const hoursLine =
-      win.openAt || win.closeAt
-        ? `<div class="banner-detail">変更可能時間：${escapeHtml(win.openAt || "—")} ～ ${escapeHtml(win.closeAt || "—")}</div>`
+        ? `<div class="banner-detail">受付期間：${escapeHtml(startLabel)} ～ ${escapeHtml(endLabel)}</div>`
         : "";
     const lockedReason = !win.known
       ? ""
       : !win.inPeriod
       ? "（受付期間外です）"
-      : !win.inHours
-      ? "（変更可能時間外です）"
       : "";
     const banner = `
       <div class="status-banner ${canEdit ? "ok" : "locked"}">
@@ -921,7 +920,6 @@ function bootStudent(tok) {
             canEdit ? "現在、希望の変更が可能です。" : "現在は希望の変更ができません。" + lockedReason
           }</div>
           ${periodLine}
-          ${hoursLine}
         </div>
       </div>`;
 
@@ -949,15 +947,17 @@ function bootStudent(tok) {
            ${pick(matching, ["is_test"], false) ? `<div class="result-note">※これはテスト実行の結果です。</div>` : ""}
          </div>`;
 
+    const secondStartsOn = pick(settings, ["second_starts_on"], "");
+    const secondDeadlineOn = pick(settings, ["second_deadline_on"], "");
+    const secondPeriodLine =
+      secondStartsOn || secondDeadlineOn
+        ? `<div class="banner-detail">2次マッチング期間目安：${escapeHtml(fmtDateOnly(secondStartsOn) || "指定なし")} ～ ${escapeHtml(fmtDateOnly(secondDeadlineOn) || "指定なし")}</div>`
+        : "";
     const matchingStatus = !matching
       ? banner
       : iAmConfirmed
       ? `<div class="status-banner locked"><div class="banner-lines"><div class="banner-status">1次マッチングで確定したため、希望の変更はできません。</div></div></div>`
-      : `<div class="status-banner ok"><div class="banner-lines"><div class="banner-status">2次マッチング中です。空きのある枠のみ選択できます。</div>${
-          pick(settings, ["second_deadline_on"], "")
-            ? `<div class="banner-detail">2次マッチング締切目安：${escapeHtml(fmtDateOnly(pick(settings, ["second_deadline_on"], "")))}</div>`
-            : ""
-        }</div></div>`;
+      : `<div class="status-banner ok"><div class="banner-lines"><div class="banner-status">2次マッチング中です。空きのある枠のみ選択できます。</div>${secondPeriodLine}</div></div>`;
 
     $main.innerHTML = `
       ${resultBanner}
@@ -1373,7 +1373,8 @@ function bootAdmin() {
              <div class="card">
                <h3>2次マッチング対象（${second.length} 名）</h3>
                <p class="muted">
-                 締切目安：${escapeHtml(fmtDateOnly(pick(state.settings, ["second_deadline_on"], "")) || "未設定")}
+                 期間目安：${escapeHtml(fmtDateOnly(pick(state.settings, ["second_starts_on"], "")) || "指定なし")}
+                 ～ ${escapeHtml(fmtDateOnly(pick(state.settings, ["second_deadline_on"], "")) || "指定なし")}
                  （表示のみです。自動ロックはされません。設定タブで変更できます）
                </p>
                <div class="table-wrap"><table>
@@ -1468,7 +1469,9 @@ function bootAdmin() {
           <h2 style="margin:0;">学生一覧（全 ${state.students.length} 名）</h2>
           <span class="spacer"></span>
           <input type="text" id="student-search" placeholder="氏名で検索" style="max-width:220px;" />
+          <button type="button" class="btn-secondary" id="reset-all-choices-btn">全員の選択をリセット</button>
         </div>
+        <p class="muted">テストで動かした選択を消して、まっさらな状態に戻したいときに使ってください。1次マッチングの結果は消えません（別途「マッチング」タブのテスト確定取り消しを使ってください）。</p>
         <div class="table-wrap">
           <table id="students-table">
             <thead><tr><th>氏名</th><th>学生コード</th><th>現在の選択</th><th>個人URL</th><th>操作</th></tr></thead>
@@ -1498,6 +1501,19 @@ function bootAdmin() {
         </div>
       </div>
     `;
+
+    document.getElementById("reset-all-choices-btn").addEventListener("click", async () => {
+      if (!confirm("全員の選択を空欄に戻します。テストで動かした分を消す場合に使ってください。元に戻せません。よろしいですか？")) return;
+      const { error } = await sb.from("students").update({ current_slot_id: null }).not("id", "is", null);
+      if (error) {
+        showToast("リセットに失敗しました: " + error.message);
+        return;
+      }
+      showToast("全員の選択をリセットしました");
+      await loadAll();
+      state.tab = "students";
+      renderDashboard();
+    });
 
     document.getElementById("add-student-form").addEventListener("submit", async (ev) => {
       ev.preventDefault();
@@ -1590,32 +1606,33 @@ function bootAdmin() {
             <input type="text" id="s-title" value="${escapeHtml(pick(s, ["title"], ""))}" />
           </div>
           <div class="field">
-            <label>受付開始日 (starts_on)</label>
+            <label>受付開始日</label>
             <input type="date" id="s-starts" value="${escapeHtml(toDateInputValue(pick(s, ["starts_on"], "")))}" />
           </div>
           <div class="field">
-            <label>締切日 (deadline_on)</label>
+            <label>受付開始時刻</label>
+            <input type="time" id="s-open" value="${escapeHtml(toTimeInputValue(pick(s, ["daily_open"], "")))}" />
+          </div>
+          <div class="field">
+            <label>受付終了日</label>
             <input type="date" id="s-deadline" value="${escapeHtml(toDateInputValue(pick(s, ["deadline_on"], "")))}" />
+          </div>
+          <div class="field">
+            <label>受付終了時刻</label>
+            <input type="time" id="s-close" value="${escapeHtml(toTimeInputValue(pick(s, ["daily_close"], "")))}" />
+          </div>
+          <p class="muted" style="grid-column:1/-1;margin:-4px 0 0 0;">
+            上の「開始日時」から「終了日時」までの間は、いつでも希望の変更ができます
+            （毎日決まった時間帯だけ、という制限ではありません）。
+          </p>
+          <div class="field">
+            <label>2次マッチング開始日の目安 (second_starts_on)</label>
+            <input type="date" id="s-second-starts" value="${escapeHtml(toDateInputValue(pick(s, ["second_starts_on"], "")))}" />
           </div>
           <div class="field">
             <label>2次マッチング締切日の目安 (second_deadline_on)</label>
             <input type="date" id="s-second-deadline" value="${escapeHtml(toDateInputValue(pick(s, ["second_deadline_on"], "")))}" />
-            <p class="muted" style="margin-top:4px;">表示のみです。この日を過ぎても自動ロックはされません（人が判断してください）。</p>
-          </div>
-          <div class="field">
-            <label>受付開始時刻 (daily_open)</label>
-            <input type="time" id="s-open" value="${escapeHtml(toTimeInputValue(pick(s, ["daily_open"], "")))}" />
-          </div>
-          <div class="field">
-            <label>受付終了時刻 (daily_close)</label>
-            <input type="time" id="s-close" value="${escapeHtml(toTimeInputValue(pick(s, ["daily_close"], "")))}" />
-          </div>
-          <div class="field">
-            <label>時間外モード (after_hours_mode)</label>
-            <select id="s-afterhours">
-              <option value="lock" ${afterHoursKey(pick(s, ["after_hours_mode"], "")) === "lock" ? "selected" : ""}>ロック（編集不可）</option>
-              <option value="allow" ${afterHoursKey(pick(s, ["after_hours_mode"], "")) === "allow" ? "selected" : ""}>許可（編集可）</option>
-            </select>
+            <p class="muted" style="margin-top:4px;">どちらも表示のみです。過ぎても自動ロックはされません（人が判断してください）。</p>
           </div>
           <div class="field" style="grid-column:1/-1;">
             <button type="submit" class="btn-primary">保存</button>
@@ -1631,28 +1648,16 @@ function bootAdmin() {
         starts_on: document.getElementById("s-starts").value || null,
         deadline_on: document.getElementById("s-deadline").value || null,
         second_deadline_on: document.getElementById("s-second-deadline").value || null,
+        second_starts_on: document.getElementById("s-second-starts").value || null,
         daily_open: fromTimeInputValue(document.getElementById("s-open").value),
         daily_close: fromTimeInputValue(document.getElementById("s-close").value),
       };
       const idField = pick(s, ["id"], undefined);
-      const storedMode = pick(s, ["after_hours_mode"], "");
-      const selectedKey = document.getElementById("s-afterhours").value;
-      const modeChanged = selectedKey !== afterHoursKey(storedMode);
-      const attempts = modeChanged ? [...afterHoursValues(selectedKey, ""), null] : [null];
-      let data = null;
-      let error = null;
-      let appliedMode = null;
-      for (const mode of attempts) {
-        const q = sb
-          .from("app_settings")
-          .update(mode === null ? payload : { ...payload, after_hours_mode: mode });
-        ({ data, error } =
-          idField !== undefined
-            ? await q.eq("id", idField).select()
-            : await q.not("id", "is", null).select());
-        appliedMode = mode;
-        if (!error || (error.code !== "23514" && error.code !== "22P02")) break;
-      }
+      const q = sb.from("app_settings").update(payload);
+      const { data, error } =
+        idField !== undefined
+          ? await q.eq("id", idField).select()
+          : await q.not("id", "is", null).select();
       if (error) {
         showToast("保存に失敗しました: " + error.message);
         return;
@@ -1661,11 +1666,7 @@ function bootAdmin() {
         showToast("保存対象の設定行が見つかりませんでした");
         return;
       }
-      if (modeChanged && appliedMode === null) {
-        showToast("時間外モード以外を保存しました（時間外モードの設定値が不明なため変更できませんでした）", 5000);
-      } else {
-        showToast("設定を保存しました");
-      }
+      showToast("設定を保存しました");
       await loadAll();
       state.tab = "settings";
       renderDashboard();
